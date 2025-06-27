@@ -319,17 +319,29 @@ def scrape_stock_articles_by_date_range(stock_data, proxy=None):
         current_page = actual_current_page
         
         search_attempts = 0
-        
-        page_distance_records = {} 
-
+            
+        distance_history = {            
+            stock_code:[abs(0),0]
+        }
         while not (current_page_oldest_date <= end_date <= current_page_latest_date):
             search_attempts += 1
-            if search_attempts > MAX_PRECISION_SEARCH_PAGES * 2: # 초기 유추 단계에서도 무한루프 방지
-                print(f"경고: 종목 {stock_code} - 유추 단계 최대 탐색 시도 횟수({MAX_PRECISION_SEARCH_PAGES * 2}) 초과. 정밀 탐색으로 전환하거나 크롤링 중단.")
+            if search_attempts > MAX_PRECISION_SEARCH_PAGES / 2: # 초기 유추 단계에서도 무한루프 방지
+                print(f"경고: 종목 {stock_code} - 유추 단계 최대 탐색 시도 횟수({MAX_PRECISION_SEARCH_PAGES / 2}) 초과. 정밀 탐색으로 전환하거나 크롤링 중단.")
                 break
+            
 
             distance_to_end = (current_page_latest_date - end_date).days
-            page_distance_records[current_page] = distance_to_end
+            if distance_history[stock_code][0] == 0:
+                distance_history[stock_code][0] = abs(distance_to_end)
+            
+            if abs(distance_to_end) > distance_history[stock_code][0] :
+                print(f"경고: 종목 {stock_code} - 현재 유추 값의 거리({abs(distance_to_end)})가 이전 거리 값({distance_history[stock_code][0]})보다 멀어짐으로 정밀 탐색으로 전환합니다.")
+                current_page = distance_history[stock_code][1]
+                break
+            else :
+                distance_history[stock_code][0] = abs(distance_to_end)
+            
+            distance_history[stock_code][1] = current_page
             
             if abs(distance_to_end) > 365 * 2:
                 weight = 5
@@ -354,10 +366,14 @@ def scrape_stock_articles_by_date_range(stock_data, proxy=None):
                 break
             
             next_page = max(1, min(last_page, next_page))
-            if next_page == current_page:
+            if next_page == current_page :
                 print(f"정보: 종목 {stock_code} - 더 이상 이동할 페이지가 없습니다. 정밀 탐색 시작.")
                 break
-
+            if current_page + next_page < 1 :
+                print(f"정보: 종목 {stock_code} - 더 이상 이동할 페이지가 없습니다. 정밀 탐색 시작.")
+                current_page = 1
+                break
+            
             try:
                 page_move_by_list_button(driver, wait, stock_code, next_page)
                 
@@ -423,7 +439,6 @@ def scrape_stock_articles_by_date_range(stock_data, proxy=None):
         else:
             crwaling_start_page = current_page
             print(f"경고: 종목 {stock_code} - end_date({end_date})가 최종 페이지({current_page}) 범위({current_page_latest_date} ~ {current_page_oldest_date})에 포함되지 않음. 가장 가까운 페이지에서 크롤링 시작: {crwaling_start_page}")
-
 
         # ----------------------------------------------------------------------
         # 10. 게시글 및 댓글 실제 크롤링 시작
@@ -548,19 +563,19 @@ def scrape_stock_articles_by_date_range(stock_data, proxy=None):
 
             if stop_crawling:
                 break
-            save_to_csv(all_articles_data, output_dir="output", filename=f"naver_stock_articles_{stock_code}.csv")
+            save_to_csv(all_articles_data, output_dir="output", filename=f"naver_stock_articles_{election}_{candidate}_{stock_code}.csv")
             current_crawling_page += 1 # 다음 페이지로 이동
 
         # 크롤링 완료 후 데이터 저장
         if all_articles_data:
-            save_to_csv(all_articles_data, output_dir="output", filename=f"naver_stock_articles_{stock_code}.csv")
+            save_to_csv(all_articles_data, output_dir="output", filename=f"naver_stock_articles_{election}_{candidate}_{stock_code}.csv")
         else:
             print(f"정보: 종목 {stock_code} - 크롤링된 게시글이 없습니다. CSV를 생성하지 않습니다.")
 
         return all_articles_data
 
     except Exception as e:
-        print(f"치명적 오류: 종목 {stock_code} 크롤링 중 예상치 못한 오류 발생")
+        print(f"치명적 오류: 종목 {stock_code} 크롤링 중 예상치 못한 오류 발생:{e}")
     finally:
         if driver:
             driver.quit() # 드라이버 종료 (매우 중요)
