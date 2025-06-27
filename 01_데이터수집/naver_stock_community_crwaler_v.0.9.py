@@ -11,13 +11,15 @@ from selenium.common.exceptions import NoSuchElementException, TimeoutException,
 import pandas as pd
 import os
 from concurrent.futures import ThreadPoolExecutor
+import argparse
 
 
 # 전역 설정 (필요에 따라 config 파일로 분리 가능)
 MAX_PRECISION_SEARCH_PAGES = 100 # 정밀 탐색 최대 시도 페이지 수 (무한 루프 방지)
-RANDOM_DELAY_MIN = 1.0 # 최소 랜덤 지연 시간 (초)
-RANDOM_DELAY_MAX = 3.0 # 최대 랜덤 지연 시간 (초)
-THEME_STOCK_LIST_PATH = 'data/test_stock_list_piece.csv'
+RANDOM_DELAY_MIN = 0.3 # 최소 랜덤 지연 시간 (초)
+RANDOM_DELAY_MAX = 1.9 # 최대 랜덤 지연 시간 (초)
+OUTPUT_DIR = 'output'
+
 
 # --- 유틸리티 함수 ---
 def initialize_driver(proxy=None):
@@ -121,18 +123,6 @@ def scrape_article_details(driver, article_url):
         "article_comments" : "",
         "article_url" : article_url,
     }
-    
-    '''
-    - article_title : "table.view > tbody > tr:nth-child(1) > th:nth-child(1) > strong"
-    - article_date : "table.view > tbody > tr:nth-child(2) > th.gray03.p9.tah"
-    - article_nickname : "table.view > tbody > tr:nth-child(2) > th.info > span.gray03 > strong" 
-    - article_viewers : "table.view > tbody > tr:nth-child(1) > th:nth-child(2) > span"
-    - article_likes : "table.view > tbody > tr:nth-child(1) > th:nth-child(2) > strong.tah.p11.red01._goodCnt"
-    - article_dislikes : "table.view > tbody > tr:nth-child(1) > th:nth-child(2) > strong.tah.p11.blue01._badCnt"
-    - article_content : "#body"
-    - article_comments : "span.u_cbox_contents"
-    - article_url : 
-    '''
 
     # 게시글 상세 페이지로 이동
     try:
@@ -244,7 +234,7 @@ def scrape_stock_articles_by_date_range(stock_data, proxy=None):
                 print(f"경고: 종목 {stock_code} - 맨 뒤 페이지 이동 후 URL 페이지({current_url_page})와 last_page({last_page}) 불일치.")
             
             try:
-                last_article_date_element = driver.find_element(By.CSS_SELECTOR, "table.type2 tbody tr:nth-last-child(3) td span.tah")
+                last_article_date_element = driver.find_element(By.CSS_SELECTOR, "td span.tah")
                 article_oldest_date_str = last_article_date_element.text.strip()
                 article_oldest_date = parse_article_date(article_oldest_date_str)
                 print(f"정보: 종목 {stock_code} - 마지막 페이지 가장 오래된 게시글 날짜: {article_oldest_date}")
@@ -611,26 +601,155 @@ def save_to_csv(data_list, output_dir="output", filename="crawled_articles.csv")
         print(f"오류: CSV 파일 저장 중 오류 발생: {e}")
 
 
-def load_theme_stock_list(file_path):
+# --- 필터링 로직 ---
+def filter_stock_list_or(df, filter_option_str):
+    """
+    DataFrame을 주어진 필터링 문자열에 따라 'election', 'candidate', 'category' 컬럼에 대한 부분 문자열 일치 또는
+    'stock_code' 컬럼에 대한 정확한 일치로 필터링합니다.
+    예: "20대 이재명 정책주" -> '20대'는 election, '이재명'은 candidate, '정책주'는 category와 일치하는지 확인
+    예: "039240" -> '039240'은 stock_code와 일치하는지 확인
+    """
+    if not filter_option_str:
+        return df
+
+    keywords = filter_option_str.split()
+    if not keywords:
+        return df
+
+    # 필터링할 컬럼 지정 (기존 키워드 검색용)
+    text_search_columns = ['election', 'candidate', 'category']
+    stock_code_column = 'stock_code' # stock_code는 별도로 정확히 일치하는지 확인
+
+    condition = pd.Series([False] * len(df), index=df.index) # 초기값은 모두 False
+
+    for keyword in keywords:
+        # 1. 텍스트 검색 컬럼 (election, candidate, category)에 대한 조건
+        for col in text_search_columns:
+            if col in df.columns:
+                # 대소문자 구분 없이, 부분 일치 (contains)로 검색
+                condition = condition | df[col].astype(str).str.contains(keyword, case=False, na=False)
+            else:
+                print(f"경고: 필터링 컬럼 '{col}'이 CSV 파일에 없습니다. 해당 컬럼은 필터링에서 제외됩니다.")
+        
+        # 2. stock_code 컬럼에 대한 정확한 일치 조건
+        if stock_code_column in df.columns:
+            # stock_code는 정확히 일치하는 경우를 찾습니다.
+            condition = condition | (df[stock_code_column].astype(str).str.strip().str.lower() == keyword.strip().lower())
+        else:
+            print(f"경고: 필터링 컬럼 '{stock_code_column}'이 CSV 파일에 없습니다. 해당 컬럼은 필터링에서 제외됩니다.")
+
+    filtered_df = df[condition]
+    print(f"정보: 필터링 옵션 '{filter_option_str}'에 따라 {len(filtered_df)}개의 종목이 필터링되었습니다.")
+    if filtered_df.empty:
+        print("경고: 필터링 조건에 해당하는 종목이 없습니다. 모든 항목이 제외됩니다.")
+    return filtered_df
+
+
+def filter_stock_list_and(df, filter_option_str):
+    """
+    DataFrame을 주어진 필터링 문자열에 따라 'election', 'candidate', 'category' 컬럼에 대한 부분 문자열 일치 또는
+    'stock_code' 컬럼에 대한 정확한 일치로 필터링합니다.
+    입력된 모든 키워드에 대해 AND 연산으로 필터링합니다.
+
+    예: "20대 이재명 정책주" -> '20대', '이재명', '정책주' 키워드를 모두 만족하는 행을 찾습니다.
+        (한 행 안에서 '20대'가 발견되고, '이재명'이 발견되고, '정책주'가 발견되어야 함)
+    예: "039240" -> '039240'은 stock_code와 일치하는지 확인합니다.
+    """
+    if not filter_option_str:
+        return df
+
+    keywords = filter_option_str.split()
+    if not keywords:
+        return df
+
+    # 필터링할 컬럼 지정
+    text_search_columns = ['election', 'candidate', 'category']
+    stock_code_column = 'stock_code'
+
+    # 최종 AND 조건을 저장할 Series, 초기값은 모두 True
+    # True로 시작해야 각 키워드 조건을 & (AND) 연산으로 누적할 수 있습니다.
+    final_condition = pd.Series([True] * len(df), index=df.index)
+
+    for keyword in keywords:
+        # 현재 키워드에 대한 조건을 저장할 Series (OR 연산용), 초기값은 모두 False
+        # False로 시작해야 각 컬럼의 조건을 | (OR) 연산으로 누적할 수 있습니다.
+        keyword_condition = pd.Series([False] * len(df), index=df.index)
+
+        # 1. 텍스트 검색 컬럼 (election, candidate, category)에 대한 OR 조건
+        for col in text_search_columns:
+            if col in df.columns:
+                # 현재 키워드가 텍스트 컬럼 중 하나라도 포함되면 True
+                keyword_condition = keyword_condition | df[col].astype(str).str.contains(keyword, case=False, na=False)
+            else:
+                print(f"경고: 필터링 컬럼 '{col}'이 CSV 파일에 없습니다. 해당 컬럼은 필터링에서 제외됩니다.")
+
+        # 2. stock_code 컬럼에 대한 OR 조건
+        if stock_code_column in df.columns:
+            # 현재 키워드가 stock_code와 정확히 일치해도 True
+            keyword_condition = keyword_condition | (df[stock_code_column].astype(str).str.strip().str.lower() == keyword.strip().lower())
+        else:
+            print(f"경고: 필터링 컬럼 '{stock_code_column}'이 CSV 파일에 없습니다. 해당 컬럼은 필터링에서 제외됩니다.")
+
+        # 3. 현재 키워드에 대한 통합 조건(keyword_condition)을
+        #    최종 조건(final_condition)에 AND 연산으로 누적합니다.
+        final_condition = final_condition & keyword_condition
+
+    filtered_df = df[final_condition]
+    print(f"정보: 필터링 옵션 '{filter_option_str}'에 따라 {len(filtered_df)}개의 종목이 필터링되었습니다.")
+    if filtered_df.empty:
+        print("경고: 필터링 조건에 해당하는 종목이 없습니다.")
+
+    return filtered_df
+
+def load_theme_stock_list(file_path, filter_option=None, filter_logic='or'):
     """테마주 목록 CSV 파일을 로드하고 필요한 컬럼을 반환합니다."""
     if not os.path.exists(file_path):
         print(f"오류: 테마주 목록 파일이 없습니다. '{file_path}' 경로를 확인해주세요.")
         return pd.DataFrame()
     
     df = pd.read_csv(file_path, dtype=str)
-    df = df[['election', 'candidate', 'stock_name', 'stock_code', 'category', 'start_date', 'end_date']]
+    # 필요한 컬럼이 모두 있는지 확인
+    required_columns = ['election', 'candidate', 'stock_name', 'stock_code', 'category', 'start_date', 'end_date']
+    if not all(col in df.columns for col in required_columns):
+        missing_cols = [col for col in required_columns if col not in df.columns]
+        print(f"오류: CSV 파일에 필수 컬럼이 누락되었습니다: {', '.join(missing_cols)}. 파일을 확인해주세요.")
+        return pd.DataFrame()
+
+    df = df[required_columns].copy()
     df['start_date'] = pd.to_datetime(df['start_date'])
     df['end_date'] = pd.to_datetime(df['end_date'])
     print(f"--- 총 {len(df)}개의 테마주 정보를 로드했습니다. ---")
+
+    # 필터링 적용
+    if filter_option:
+        # logic 인자에 따라 적절한 필터링 함수 호출
+        print(f"정보: '{filter_logic.upper()}' 논리로 필터링을 적용합니다.")
+        if filter_logic.lower() == 'and':
+            df = filter_stock_list_and(df, filter_option)
+        else: # 기본값 또는 'or'일 경우
+            df = filter_stock_list_or(df, filter_option)
     return df
 
 
-# --- 메인 실행 로직 (예시) ---
 def main():
-    # 실제 사용 시 이 부분을 변경하여 사용자의 입력 또는 파일에서 종목 데이터 로드
-    
-    stock_list_to_crawl = load_theme_stock_list(THEME_STOCK_LIST_PATH)
+    parser = argparse.ArgumentParser(description="네이버 종목 토론방 게시글 크롤러")
+    parser.add_argument('-f', '--file', type=str, default='data/stock_list.csv',
+                        help="크롤링할 종목 목록이 담긴 CSV 파일 경로 (기본값: data/stock_list.csv)")
+    parser.add_argument('-w', '--workers', type=int, default=3,
+                        help="동시에 실행할 쓰레드(작업자) 수 (기본값: 3)")
+    parser.add_argument('-o', '--option', type=str, default=None,
+                        help="필터링할 문자열 (예: '20대 이재명 정책주'). 'election', 'candidate', 'category', 'stock_code' 컬럼에서 검색합니다.")
+    parser.add_argument('-l', '--logic', type=str, default='or', choices=['or', 'and'],
+                        help="필터링 키워드 간의 검색 조건 ('or' 또는 'and', 기본값: or)")
+    args = parser.parse_args()
+   
+    stock_list_to_crawl = load_theme_stock_list(args.file, args.option, args.logic)
     stock_list_to_crawl = stock_list_to_crawl.to_dict('records')
+    
+    if not stock_list_to_crawl:
+        print("경고: 크롤링할 종목 데이터가 없습니다. 프로그램을 종료합니다.")
+        return
+
     # 프록시 리스트 (필요하다면 사용)
     # proxy_list = ["http://your.proxy.com:8080", "http://another.proxy.com:8080"]
     proxy_list = [None] # 프록시를 사용하지 않을 경우
@@ -640,7 +759,7 @@ def main():
     # ThreadPoolExecutor를 사용하여 여러 종목을 동시에 크롤링 (병렬 처리)
     # max_workers는 동시에 실행될 스레드(작업자)의 수
     # 주의: 웹사이트에 과도한 요청을 보내지 않도록 적절한 max_workers와 지연 시간 설정이 중요합니다.
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    with ThreadPoolExecutor(max_workers=args.workers) as executor: # --- 수정된 부분: args.workers 사용 ---
         futures = []
         for i, stock_data in enumerate(stock_list_to_crawl):
             # 각 종목에 대해 랜덤으로 프록시 할당 (또는 None 할당)
